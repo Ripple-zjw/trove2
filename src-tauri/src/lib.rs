@@ -20,6 +20,7 @@ pub fn run() {
             commands::video::check_ffmpeg,
             commands::video::concat_videos,
             commands::video::cancel_concat,
+            commands::video::show_item_in_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

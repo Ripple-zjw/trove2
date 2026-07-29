@@ -2,6 +2,7 @@
   import { tools, searchQuery, selectedCategory } from '../stores';
   import GlassPanel from '../components/GlassPanel.svelte';
   import EmptyState from '../components/EmptyState.svelte';
+  import VideoConcat from '../components/VideoConcat.svelte';
   import { navigateTo } from '../router';
   import type { Tool } from '../types';
 
@@ -34,7 +35,11 @@
         </div>
       </div>
       <div class="tool-body">
-        <p class="tool-placeholder">工具功能开发中…</p>
+        {#if found?.id === 'video-concat'}
+          <VideoConcat />
+        {:else}
+          <p class="tool-placeholder">工具功能开发中…</p>
+        {/if}
       </div>
     </GlassPanel>
   {:else}
