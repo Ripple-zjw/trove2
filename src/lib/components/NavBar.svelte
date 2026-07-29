@@ -33,7 +33,7 @@
     {#if route.page !== 'home'}
       <button class="nav-back" onclick={goHome}>← 返回</button>
     {/if}
-    <h1 class="nav-title" onclick={goHome} role="button" tabindex="0">Trove2</h1>
+    <h1 class="nav-title" onclick={goHome} onkeydown={(e) => e.key === 'Enter' && goHome()} role="button" tabindex="0">Trove2</h1>
   </div>
   {#if showSearch}
     <div class="nav-search">

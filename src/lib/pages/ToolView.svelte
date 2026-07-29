@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tools } from '../stores';
+  import { tools, searchQuery, selectedCategory } from '../stores';
   import GlassPanel from '../components/GlassPanel.svelte';
   import EmptyState from '../components/EmptyState.svelte';
   import { navigateTo } from '../router';
@@ -44,7 +44,7 @@
       description="可能该工具尚未添加，或链接有误"
     />
     <div class="tool-view-back">
-      <button class="back-btn" onclick={() => navigateTo('/')}>
+      <button class="back-btn" onclick={() => { searchQuery.set(''); selectedCategory.set(''); navigateTo('/'); }}>
         ← 返回主页
       </button>
     </div>
