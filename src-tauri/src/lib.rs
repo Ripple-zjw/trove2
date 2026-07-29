@@ -5,6 +5,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 pub(crate) struct AppState {
+    /// 全局取消标志，当前只支持单个 concat 操作同时运行。
+    /// 若有并发需求，需要改为每操作一个 flag 或使用 channel。
     pub cancel_flag: Arc<AtomicBool>,
 }
 

@@ -140,11 +140,6 @@ fn is_format_error(stderr: &str) -> bool {
     patterns.iter().any(|p| stderr.contains(p))
 }
 
-/// 检查错误消息是否为用户取消
-fn is_cancel_error(msg: &str) -> bool {
-    msg.contains("取消了")
-}
-
 // ============ 核心 ffmpeg 运行函数 ============
 
 /// 共享的 ffmpeg 执行函数：启动 ffmpeg、解析 stdout 进度、发射事件、检查取消、等待完成、读取 stderr
@@ -330,7 +325,6 @@ fn run_concat_reencode(
 fn build_concat_result_success(
     start: Instant,
     output: &str,
-    _duration_us: u64,
 ) -> ConcatResult {
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let file_size = std::fs::metadata(output).ok().map(|m| m.len());
@@ -345,7 +339,6 @@ fn build_concat_result_success(
 
 fn build_concat_result_failure(
     error: Option<String>,
-    _duration_us: u64,
     start: Instant,
 ) -> ConcatResult {
     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -361,13 +354,20 @@ fn build_concat_result_failure(
 // ============ Tauri 命令 ============
 
 #[tauri::command]
-pub async fn concat_videos(
+pub fn concat_videos(
     app: tauri::AppHandle,
     inputs: Vec<String>,
     output_path: String,
     format: String,
 ) -> Result<ConcatResult, String> {
     let start = Instant::now();
+
+    // 0. 检查输入文件是否存在
+    for input in &inputs {
+        if !std::path::Path::new(input).exists() {
+            return Err(format!("文件不存在: {}", input));
+        }
+    }
 
     // 1. 重置取消标志
     app.state::<AppState>().cancel_flag.store(false, Ordering::SeqCst);
@@ -418,7 +418,7 @@ pub async fn concat_videos(
         match copy_result {
             Ok((status, _)) if status.success() => {
                 // copy 成功
-                return Ok(build_concat_result_success(start, &output, total_duration_us));
+                return Ok(build_concat_result_success(start, &output));
             }
             Ok((_, stderr)) => {
                 // copy 运行但失败
@@ -429,7 +429,6 @@ pub async fn concat_videos(
                     let _ = std::fs::remove_file(&output);
                     return Ok(build_concat_result_failure(
                         Some("用户取消了拼接操作".to_string()),
-                        total_duration_us,
                         start,
                     ));
                 }
@@ -437,7 +436,7 @@ pub async fn concat_videos(
             }
             Err(e) => {
                 // ffmpeg 无法启动或被取消
-                if is_cancel_error(&e) {
+                if cancel_flag.load(Ordering::SeqCst) {
                     let _ = std::fs::remove_file(&output);
                     return Err(e);
                 }
@@ -449,10 +448,10 @@ pub async fn concat_videos(
     // 6. 使用 reencode 模式（编码不同或 copy 失败需要回退）
     match run_concat_reencode(&app, &inputs, &output, cancel_flag.clone(), total_duration_us) {
         Ok((status, _stderr)) if status.success() => {
-            Ok(build_concat_result_success(start, &output, total_duration_us))
+            Ok(build_concat_result_success(start, &output))
         }
         Ok((_, stderr)) => {
-            Ok(build_concat_result_failure(Some(stderr), total_duration_us, start))
+            Ok(build_concat_result_failure(Some(stderr), start))
         }
         Err(e) => Err(e),
     }
@@ -478,7 +477,9 @@ pub fn check_ffmpeg() -> FfmpegInfo {
         match output {
             Ok(out) if out.status.success() => {
                 let version_str = String::from_utf8_lossy(&out.stdout);
-                let version_line = version_str.lines().next().unwrap_or("").to_string();
+                let version_str_err = String::from_utf8_lossy(&out.stderr);
+                let combined = format!("{}{}", version_str, version_str_err);
+                let version_line = combined.lines().next().unwrap_or("").to_string();
                 FfmpegInfo {
                     installed: true,
                     version: Some(version_line),

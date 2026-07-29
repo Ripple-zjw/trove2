@@ -24,7 +24,6 @@
     { value: 'avi', label: 'AVI', ext: '.avi' },
     { value: 'webm', label: 'WebM', ext: '.webm' },
   ];
-  let selectedFormat = $derived(formats.find(f => f.value === outputFormat)!);
 
   // --- 生命周期 ---
   $effect(() => {
