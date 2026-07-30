@@ -8,7 +8,8 @@
   let query = $state('');
   let category = $state('');
 
-  const CATEGORIES = ['全部', '文本', '转换', '加密', '开发', '图片', '其他'];
+  // 从工具列表动态提取分类，并自动加入"全部"
+  let categories = $derived(['全部', ...new Set(allTools.map(t => t.category).filter(Boolean))]);
 
   $effect(() => {
     const unsubTools = tools.subscribe((t) => { allTools = t; });
@@ -52,7 +53,7 @@
 
     {#if hasTools}
       <div class="category-bar">
-        {#each CATEGORIES as cat}
+        {#each categories as cat}
           <button
             class="category-chip"
             class:active={category === cat || (!category && cat === '全部')}

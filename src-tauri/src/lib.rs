@@ -22,6 +22,7 @@ pub fn run() {
             commands::video::check_ffmpeg,
             commands::video::concat_videos,
             commands::video::cancel_concat,
+            commands::video::get_video_info,
             commands::video::show_item_in_folder,
         ])
         .run(tauri::generate_context!())

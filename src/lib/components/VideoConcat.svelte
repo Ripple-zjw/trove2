@@ -4,14 +4,29 @@
   import { open, save } from '@tauri-apps/plugin-dialog';
   import GlassPanel from './GlassPanel.svelte';
 
+  // --- 类型 ---
+  interface FileInfo {
+    path: string;
+    name: string;
+    duration_us: number;
+    file_size: number;
+    loading: boolean;
+    error?: string;
+  }
+
+  type SortField = 'order' | 'duration' | 'size';
+
   // --- 状态 ---
   let ffmpegInfo = $state<{ installed: boolean; version?: string; path?: string } | null>(null);
   let ffmpegLoading = $state(true);
 
-  let files = $state<string[]>([]);
+  let files = $state<FileInfo[]>([]);
   let outputFormat = $state('mp4');
   let outputPath = $state('');
-  let dragIndex = $state<number | null>(null);
+  let dragSourceIndex = $state<number | null>(null);
+  let dropTargetIndex = $state<number | null>(null);
+  let sortField = $state<SortField>('order');
+  let sortAsc = $state(true);
 
   let running = $state(false);
   let progress = $state<{ percent: number; speed: string; eta: string } | null>(null);
@@ -49,8 +64,35 @@
         extensions: ['mp4', 'mov', 'mkv', 'avi', 'webm', 'mpeg', 'wmv', 'flv'],
       }],
     });
-    if (selected) {
-      files = [...files, ...selected];
+    if (selected && selected.length > 0) {
+      const newInfos: FileInfo[] = selected.map(p => ({
+        path: p,
+        name: getFileName(p),
+        duration_us: 0,
+        file_size: 0,
+        loading: true,
+      }));
+      files = [...files, ...newInfos];
+      fetchVideoInfos(selected);
+    }
+  }
+
+  async function fetchVideoInfos(paths: string[]) {
+    for (const path of paths) {
+      try {
+        const info = await invoke<{ path: string; duration_us: number; file_size: number }>('get_video_info', { path });
+        files = files.map(f =>
+          f.path === path
+            ? { ...f, duration_us: info.duration_us, file_size: info.file_size, loading: false }
+            : f
+        );
+      } catch (e) {
+        files = files.map(f =>
+          f.path === path
+            ? { ...f, loading: false, error: String(e) }
+            : f
+        );
+      }
     }
   }
 
@@ -61,28 +103,74 @@
   function clearFiles() {
     files = [];
     result = null;
+    sortField = 'order';
+    sortAsc = true;
   }
 
-  // --- 拖拽排序 ---
+  // --- 拖拽排序 (drop 触发) ---
   function handleDragStart(e: DragEvent, index: number) {
-    dragIndex = index;
+    dragSourceIndex = index;
     if (e.dataTransfer) {
       e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(index));
     }
   }
 
   function handleDragOver(e: DragEvent, index: number) {
     e.preventDefault();
-    if (dragIndex === null || dragIndex === index) return;
+    if (dragSourceIndex === null) return;
+    if (e.dataTransfer) {
+      e.dataTransfer.dropEffect = 'move';
+    }
+    dropTargetIndex = index;
+  }
+
+  function handleDragLeave(e: DragEvent) {
+    const target = e.currentTarget as HTMLElement;
+    const relatedTarget = e.relatedTarget as HTMLElement;
+    if (!target.contains(relatedTarget)) {
+      dropTargetIndex = null;
+    }
+  }
+
+  function handleDrop(e: DragEvent, index: number) {
+    e.preventDefault();
+    if (dragSourceIndex === null || dragSourceIndex === index) {
+      dragSourceIndex = null;
+      dropTargetIndex = null;
+      return;
+    }
     const newFiles = [...files];
-    const [moved] = newFiles.splice(dragIndex, 1);
+    const [moved] = newFiles.splice(dragSourceIndex, 1);
     newFiles.splice(index, 0, moved);
     files = newFiles;
-    dragIndex = index;
+    dragSourceIndex = null;
+    dropTargetIndex = null;
   }
 
   function handleDragEnd() {
-    dragIndex = null;
+    dragSourceIndex = null;
+    dropTargetIndex = null;
+  }
+
+  // --- 排序 (点击后直接重排 files 数组) ---
+  function toggleSort(field: SortField) {
+    if (field === 'order') {
+      sortField = 'order';
+      return;
+    }
+    const asc = field === sortField ? !sortAsc : true;
+    sortField = field;
+    sortAsc = asc;
+    files = [...files].sort((a, b) => {
+      let cmp: number;
+      if (field === 'duration') {
+        cmp = a.duration_us - b.duration_us;
+      } else {
+        cmp = Number(a.file_size) - Number(b.file_size);
+      }
+      return asc ? cmp : -cmp;
+    });
   }
 
   // --- 输出路径 ---
@@ -99,6 +187,7 @@
     }
   }
 
+  // --- 格式化 ---
   function formatFileSize(bytes?: number): string {
     if (!bytes) return '--';
     if (bytes < 1024) return `${bytes} B`;
@@ -107,13 +196,14 @@
     return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
   }
 
-  function formatDuration(ms?: number): string {
-    if (!ms) return '--';
-    if (ms < 1000) return `${ms} 毫秒`;
-    if (ms < 60000) return `${(ms / 1000).toFixed(1)} 秒`;
-    const m = Math.floor(ms / 60000);
-    const s = Math.round((ms % 60000) / 1000);
-    return `${m} 分 ${s} 秒`;
+  function formatDuration(us?: number): string {
+    if (!us) return '--';
+    const totalSec = Math.floor(us / 1_000_000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
   }
 
   function getFileName(path: string): string {
@@ -134,7 +224,7 @@
 
     try {
       const res = await invoke('concat_videos', {
-        inputs: files,
+        inputs: files.map(f => f.path),
         outputPath: outputPath || `concat_${Date.now()}.${outputFormat}`,
         format: outputFormat,
       });
@@ -169,7 +259,7 @@
 
 <div class="video-concat">
   <!-- ① ffmpeg 状态 -->
-  <GlassPanel padding="16px" class="status-panel">
+  <GlassPanel padding="16px">
     {#if ffmpegLoading}
       <p class="status-loading">正在检测 ffmpeg…</p>
     {:else if ffmpegInfo?.installed}
@@ -195,7 +285,7 @@
   </GlassPanel>
 
   <!-- ② 操作区 -->
-  <GlassPanel padding="20px" class="action-panel">
+  <GlassPanel padding="20px">
     <div class="action-header">
       <h3>选择视频文件</h3>
       {#if files.length > 0}
@@ -210,19 +300,50 @@
         <p class="file-empty-hint">支持 MP4、MOV、MKV、AVI、WebM 等格式</p>
       </div>
     {:else}
-      <div class="file-list">
-        {#each files as file, i (file)}
+      <div class="file-list-header">
+        <span class="hdr-index">#</span>
+        <span class="hdr-name">文件名</span>
+        <button class="hdr-sort" onclick={() => toggleSort('duration')}>
+          时长 {sortField === 'duration' ? (sortAsc ? '↑' : '↓') : ''}
+        </button>
+        <button class="hdr-sort" onclick={() => toggleSort('size')}>
+          大小 {sortField === 'size' ? (sortAsc ? '↑' : '↓') : ''}
+        </button>
+        <span class="hdr-action"></span>
+      </div>
+      <div class="file-list" role="list">
+        {#each files as file, i (file.path)}
           <div
             class="file-item"
+            class:dragging={dragSourceIndex === i}
+            class:drop-target={dropTargetIndex === i}
             draggable="true"
+            role="listitem"
             ondragstart={(e) => handleDragStart(e, i)}
             ondragover={(e) => handleDragOver(e, i)}
+            ondragleave={handleDragLeave}
+            ondrop={(e) => handleDrop(e, i)}
             ondragend={handleDragEnd}
-            class:dragging={dragIndex === i}
           >
-            <span class="drag-handle">⠿</span>
+            <span class="drag-handle" aria-hidden="true">⠿</span>
             <span class="file-index">{i + 1}</span>
-            <span class="file-name">{getFileName(file)}</span>
+            <span class="file-name" title={file.path}>{file.name}</span>
+            <span class="file-duration">
+              {#if file.loading}
+                <span class="loading-spinner"></span>
+              {:else if file.error}
+                <span class="file-error" title={file.error}>⚠️</span>
+              {:else}
+                {formatDuration(file.duration_us)}
+              {/if}
+            </span>
+            <span class="file-size">
+              {#if file.loading}
+                <span class="loading-spinner"></span>
+              {:else if !file.error}
+                {formatFileSize(file.file_size)}
+              {/if}
+            </span>
             <button class="btn-remove" onclick={() => removeFile(i)} title="移除">✕</button>
           </div>
         {/each}
@@ -232,17 +353,18 @@
 
     <div class="options-row">
       <div class="option-group">
-        <label>输出格式</label>
-        <select bind:value={outputFormat} class="select-glass">
+        <label for="output-format">输出格式</label>
+        <select id="output-format" bind:value={outputFormat} class="select-glass">
           {#each formats as fmt}
             <option value={fmt.value}>{fmt.label}</option>
           {/each}
         </select>
       </div>
       <div class="option-group">
-        <label>输出路径</label>
+        <label for="output-path">输出路径</label>
         <div class="path-row">
           <input
+            id="output-path"
             type="text"
             bind:value={outputPath}
             placeholder="可选，默认在首个文件同目录"
@@ -260,7 +382,7 @@
   </GlassPanel>
 
   <!-- ③ 执行区 -->
-  <GlassPanel padding="20px" class="exec-panel">
+  <GlassPanel padding="20px">
     {#if running}
       <div class="progress-section">
         <div class="progress-bar">
@@ -280,7 +402,7 @@
           <div>
             <p class="result-title">拼接完成！</p>
             <p class="result-detail">
-              大小: {formatFileSize(result.file_size)} | 耗时: {formatDuration(result.duration_ms)}
+              大小: {formatFileSize(result.file_size)} | 耗时: {result.duration_ms ? `${(result.duration_ms / 1000).toFixed(1)} 秒` : '--'}
             </p>
             {#if result.output_path}
               <p class="result-path">📄 {getFileName(result.output_path)}</p>
@@ -326,9 +448,8 @@
   }
 
   /* --- ffmpeg 状态 --- */
-  .status-panel { font-size: 14px; }
-  .status-loading { color: var(--text-muted); }
-  .status-ok, .status-err { display: flex; align-items: flex-start; gap: 12px; }
+  .status-loading { color: var(--text-muted); font-size: 14px; }
+  .status-ok, .status-err { display: flex; align-items: flex-start; gap: 12px; font-size: 14px; }
   .status-dot {
     width: 10px; height: 10px; border-radius: 50%;
     flex-shrink: 0; margin-top: 4px;
@@ -359,14 +480,37 @@
     border: 2px dashed var(--glass-border); border-radius: var(--radius-md);
     padding: 40px 20px; text-align: center; cursor: pointer;
     transition: border-color var(--transition);
+    outline: none;
   }
-  .file-empty:hover { border-color: var(--accent); }
+  .file-empty:hover, .file-empty:focus-visible { border-color: var(--accent); }
   .file-empty-icon { font-size: 36px; display: block; margin-bottom: 8px; }
   .file-empty p { color: var(--text-secondary); }
   .file-empty-hint { font-size: 12px; margin-top: 4px; color: var(--text-muted); }
 
+  /* 文件列表表头 */
+  .file-list-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px 6px 40px;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .hdr-index { width: 20px; flex-shrink: 0; text-align: center; }
+  .hdr-name { flex: 1; }
+  .hdr-sort {
+    width: 80px; flex-shrink: 0; text-align: right;
+    background: none; border: none;
+    color: var(--text-muted); cursor: pointer;
+    font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.5px;
+    transition: color var(--transition);
+  }
+  .hdr-sort:hover { color: var(--accent); }
+  .hdr-action { width: 24px; flex-shrink: 0; }
+
   /* 文件列表 */
-  .file-list { display: flex; flex-direction: column; gap: 6px; }
+  .file-list { display: flex; flex-direction: column; gap: 4px; }
   .file-item {
     display: flex; align-items: center; gap: 8px;
     padding: 8px 12px;
@@ -374,12 +518,16 @@
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-sm);
     cursor: grab;
-    transition: background var(--transition);
     user-select: none;
+    transition: background var(--transition), border-color var(--transition), opacity var(--transition);
   }
   .file-item:hover { background: rgba(255,255,255,0.1); }
-  .file-item.dragging { opacity: 0.5; }
-  .drag-handle { color: var(--text-muted); font-size: 14px; }
+  .file-item.dragging { opacity: 0.4; }
+  .file-item.drop-target {
+    border-color: var(--accent);
+    background: rgba(124, 108, 240, 0.1);
+  }
+  .drag-handle { color: var(--text-muted); font-size: 14px; cursor: grab; flex-shrink: 0; }
   .file-index {
     width: 20px; height: 20px; border-radius: 50%;
     background: var(--accent); color: white;
@@ -390,11 +538,25 @@
     flex: 1; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; font-size: 13px;
   }
+  .file-duration { width: 80px; flex-shrink: 0; text-align: right; font-size: 12px; color: var(--text-secondary); }
+  .file-size { width: 80px; flex-shrink: 0; text-align: right; font-size: 12px; color: var(--text-secondary); }
+  .file-error { cursor: help; }
   .btn-remove {
     background: none; border: none; color: var(--text-muted);
-    cursor: pointer; font-size: 14px; padding: 2px;
+    cursor: pointer; font-size: 14px; padding: 2px; width: 24px; flex-shrink: 0;
   }
   .btn-remove:hover { color: #f87171; }
+
+  .loading-spinner {
+    display: inline-block;
+    width: 12px; height: 12px;
+    border: 2px solid var(--text-muted);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
   .btn-add-more {
     background: none; border: 1px dashed var(--glass-border);
     color: var(--text-secondary); padding: 6px; border-radius: var(--radius-sm);

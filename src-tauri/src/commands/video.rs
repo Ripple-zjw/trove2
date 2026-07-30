@@ -34,6 +34,13 @@ pub struct ConcatResult {
     pub file_size: Option<u64>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct VideoInfo {
+    pub path: String,
+    pub duration_us: u64,
+    pub file_size: u64,
+}
+
 // ============ 辅助函数 ============
 
 /// 确保输出文件路径具有正确的容器扩展名
@@ -460,6 +467,43 @@ pub fn concat_videos(
 #[tauri::command]
 pub fn cancel_concat(state: tauri::State<'_, AppState>) {
     state.cancel_flag.store(true, Ordering::SeqCst);
+}
+
+// ============ 获取视频文件信息 ============
+
+#[tauri::command]
+pub fn get_video_info(path: String) -> Result<VideoInfo, String> {
+    // 获取文件大小
+    let metadata = std::fs::metadata(&path)
+        .map_err(|e| format!("无法读取文件信息: {}", e))?;
+    let file_size = metadata.len();
+
+    // 通过 ffprobe 获取时长
+    let output = Command::new("ffprobe")
+        .args(&[
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            &path,
+        ])
+        .output()
+        .map_err(|e| format!("无法执行 ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe 分析失败 '{}': {}", path, stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let duration_secs: f64 = stdout.trim().parse()
+        .map_err(|_| format!("无法解析视频时长: {}", path))?;
+    let duration_us = (duration_secs * 1_000_000.0) as u64;
+
+    Ok(VideoInfo {
+        path,
+        duration_us,
+        file_size,
+    })
 }
 
 // ============ 原有代码 ============
