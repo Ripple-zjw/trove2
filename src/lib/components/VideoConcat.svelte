@@ -1,11 +1,12 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { open, save } from '@tauri-apps/plugin-dialog';
+  import { open, save, ask } from '@tauri-apps/plugin-dialog';
   import GlassPanel from './GlassPanel.svelte';
 
   // --- 类型 ---
   interface FileInfo {
+    uid: string;
     path: string;
     name: string;
     duration_us: number;
@@ -23,10 +24,17 @@
   let files = $state<FileInfo[]>([]);
   let outputFormat = $state('mp4');
   let outputPath = $state('');
-  let dragSourceIndex = $state<number | null>(null);
   let dropTargetIndex = $state<number | null>(null);
+  // WKWebView 不支持 HTML5 DragEvent，用鼠标事件模拟拖拽
+  let dragState = $state<{
+    source: number;
+    startY: number;
+    dragging: boolean;
+  } | null>(null);
   let sortField = $state<SortField>('order');
   let sortAsc = $state(true);
+  let _uidCounter = 0;
+  function nextUid() { return `f${++_uidCounter}`; }
 
   let running = $state(false);
   let progress = $state<{ percent: number; speed: string; eta: string } | null>(null);
@@ -64,17 +72,47 @@
         extensions: ['mp4', 'mov', 'mkv', 'avi', 'webm', 'mpeg', 'wmv', 'flv'],
       }],
     });
-    if (selected && selected.length > 0) {
-      const newInfos: FileInfo[] = selected.map(p => ({
-        path: p,
-        name: getFileName(p),
-        duration_us: 0,
-        file_size: 0,
-        loading: true,
-      }));
-      files = [...files, ...newInfos];
-      fetchVideoInfos(selected);
+    if (!selected || selected.length === 0) return;
+
+    // 检测重复：与已有文件列表中的 path 对比，或选中文件自身重复
+    const existingPaths = new Set(files.map(f => f.path));
+    const inList = selected.filter(p => existingPaths.has(p));
+    const selfDup = selected.filter((p, i) => selected.indexOf(p) !== i);
+    const hasDuplicates = inList.length > 0 || selfDup.length > 0;
+
+    let pathsToAdd = selected;
+    if (hasDuplicates) {
+      const parts: string[] = [];
+      if (inList.length > 0) parts.push(`${inList.length} 个已在列表中`);
+      if (selfDup.length > 0) parts.push(`${selfDup.length} 个自身重复`);
+      const answer = await ask(
+        `检测到重复视频（${parts.join('，')}）。\n是否去掉重复的文件？`,
+        { title: '重复视频检测', okLabel: '去掉重复', cancelLabel: '全部保留' }
+      );
+      if (answer) {
+        // 去掉重复：移除已在列表中的和自身重复的
+        const seen = new Set(files.map(f => f.path));
+        pathsToAdd = selected.filter(p => {
+          if (seen.has(p)) return false;
+          seen.add(p);
+          return true;
+        });
+      }
+      // answer === false 时保留所有（包括重复），pathsToAdd 保持原样
     }
+
+    if (pathsToAdd.length === 0) return;
+
+    const newInfos: FileInfo[] = pathsToAdd.map(p => ({
+      uid: nextUid(),
+      path: p,
+      name: getFileName(p),
+      duration_us: 0,
+      file_size: 0,
+      loading: true,
+    }));
+    files = [...files, ...newInfos];
+    fetchVideoInfos(pathsToAdd);
   }
 
   async function fetchVideoInfos(paths: string[]) {
@@ -107,51 +145,71 @@
     sortAsc = true;
   }
 
-  // --- 拖拽排序 (drop 触发) ---
-  function handleDragStart(e: DragEvent, index: number) {
-    dragSourceIndex = index;
-    if (e.dataTransfer) {
-      e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('text/plain', String(index));
-    }
+  // --- 拖拽排序 (鼠标事件模拟，兼容 WKWebView) ---
+  // WKWebView (Tauri macOS) 对 HTML5 Drag & Drop API 支持不全，
+  // dragenter/dragover/drop 事件不可靠，改用 mousedown/mousemove/mouseup 实现。
+  function sortable(node: HTMLElement, index: number) {
+    let currentIndex = index;
+
+    const onMouseDown = (e: MouseEvent) => {
+      // 忽略移除按钮上的点击
+      if ((e.target as HTMLElement).closest('button')) return;
+      e.preventDefault();
+      dragState = { source: currentIndex, startY: e.clientY, dragging: true };
+      dropTargetIndex = currentIndex;
+    };
+
+    node.addEventListener('mousedown', onMouseDown);
+
+    return {
+      update(newIndex: number) {
+        currentIndex = newIndex;
+      },
+      destroy() {
+        node.removeEventListener('mousedown', onMouseDown);
+      },
+    };
   }
 
-  function handleDragOver(e: DragEvent, index: number) {
-    e.preventDefault();
-    if (dragSourceIndex === null) return;
-    if (e.dataTransfer) {
-      e.dataTransfer.dropEffect = 'move';
-    }
-    dropTargetIndex = index;
-  }
+  // 全局 mouse 事件：在 dragState 激活时跟踪鼠标位置计算 drop target
+  $effect(() => {
+    if (!dragState?.dragging) return;
 
-  function handleDragLeave(e: DragEvent) {
-    const target = e.currentTarget as HTMLElement;
-    const relatedTarget = e.relatedTarget as HTMLElement;
-    if (!target.contains(relatedTarget)) {
+    const onMouseMove = (e: MouseEvent) => {
+      // 遍历所有 .file-item 元素，找到鼠标 Y 坐标覆盖的那个
+      const items = document.querySelectorAll('.file-list .file-item');
+      let found = false;
+      for (let i = 0; i < items.length; i++) {
+        const rect = items[i].getBoundingClientRect();
+        if (e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          dropTargetIndex = i;
+          found = true;
+          break;
+        }
+      }
+      if (!found) dropTargetIndex = null;
+    };
+
+    const onMouseUp = () => {
+      const src = dragState?.source;
+      const dst = dropTargetIndex;
+      if (src != null && dst != null && src !== dst) {
+        const newFiles = [...files];
+        const [moved] = newFiles.splice(src, 1);
+        newFiles.splice(dst, 0, moved);
+        files = newFiles;
+      }
+      dragState = null;
       dropTargetIndex = null;
-    }
-  }
+    };
 
-  function handleDrop(e: DragEvent, index: number) {
-    e.preventDefault();
-    if (dragSourceIndex === null || dragSourceIndex === index) {
-      dragSourceIndex = null;
-      dropTargetIndex = null;
-      return;
-    }
-    const newFiles = [...files];
-    const [moved] = newFiles.splice(dragSourceIndex, 1);
-    newFiles.splice(index, 0, moved);
-    files = newFiles;
-    dragSourceIndex = null;
-    dropTargetIndex = null;
-  }
-
-  function handleDragEnd() {
-    dragSourceIndex = null;
-    dropTargetIndex = null;
-  }
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    return () => {
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+    };
+  });
 
   // --- 排序 (点击后直接重排 files 数组) ---
   function toggleSort(field: SortField) {
@@ -312,18 +370,13 @@
         <span class="hdr-action"></span>
       </div>
       <div class="file-list" role="list">
-        {#each files as file, i (file.path)}
+        {#each files as file, i (file.uid)}
           <div
             class="file-item"
-            class:dragging={dragSourceIndex === i}
+            class:dragging={dragState?.source === i && dragState?.dragging}
             class:drop-target={dropTargetIndex === i}
-            draggable="true"
             role="listitem"
-            ondragstart={(e) => handleDragStart(e, i)}
-            ondragover={(e) => handleDragOver(e, i)}
-            ondragleave={handleDragLeave}
-            ondrop={(e) => handleDrop(e, i)}
-            ondragend={handleDragEnd}
+            use:sortable={i}
           >
             <span class="drag-handle" aria-hidden="true">⠿</span>
             <span class="file-index">{i + 1}</span>
