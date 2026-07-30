@@ -1,39 +1,39 @@
 # Trove2
 
-A desktop toolbox application built with [Tauri v2](https://tauri.app/) and [Svelte 5](https://svelte.dev/).
+基于 [Tauri v2](https://tauri.app/) 和 [Svelte 5](https://svelte.dev/) 构建的桌面工具箱应用。
 
-## Features
+## 功能
 
-- **Video Concat** - Merge multiple video files into one, powered by FFmpeg
-  - Drag-and-drop file selection and reordering
-  - Real-time progress tracking with cancel support
-  - Video metadata display (duration, resolution, codec)
+- **视频拼接** - 将多个视频文件合并为一个，基于 FFmpeg
+  - 拖拽选择文件并自由排序
+  - 实时进度显示，支持取消操作
+  - 视频信息展示（时长、分辨率、编码格式）
 
-## Prerequisites
+## 环境要求
 
-- [Rust](https://rustup.rs/) (stable)
+- [Rust](https://rustup.rs/)（stable）
 - [Node.js](https://nodejs.org/) >= 18
-- [FFmpeg](https://ffmpeg.org/) installed and available in PATH
+- [FFmpeg](https://ffmpeg.org/) 已安装并在 PATH 中可用
 
-## Development
+## 开发
 
 ```bash
-# Install dependencies
+# 安装依赖
 npm install
 
-# Start dev server with hot-reload
+# 启动开发服务器（热更新）
 npm run tauri dev
 
-# Build for production
+# 构建生产版本
 npm run tauri build
 ```
 
-## Tech Stack
+## 技术栈
 
-- **Frontend**: Svelte 5 + TypeScript + Vite
-- **Backend**: Rust (Tauri v2)
-- **Video Processing**: FFmpeg (via CLI invocation)
+- **前端**: Svelte 5 + TypeScript + Vite
+- **后端**: Rust (Tauri v2)
+- **视频处理**: FFmpeg（通过命令行调用）
 
-## License
+## 开源协议
 
 [MIT](LICENSE)
