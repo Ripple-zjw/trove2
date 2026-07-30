@@ -54,3 +54,22 @@ jobs:
         with:
           name: Trove2_${{ matrix.target }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/Trove2_aarch64-apple-darwin/*.dmg
+            artifacts/Trove2_x86_64-pc-windows-msvc/*.msi
