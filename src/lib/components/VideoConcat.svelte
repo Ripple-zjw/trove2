@@ -145,6 +145,15 @@
     sortAsc = true;
   }
 
+  function defaultOutputPath() {
+    const firstPath = files[0]?.path;
+    const separatorIndex = firstPath
+      ? Math.max(firstPath.lastIndexOf('/'), firstPath.lastIndexOf('\\'))
+      : -1;
+    const directory = separatorIndex >= 0 ? firstPath!.slice(0, separatorIndex + 1) : '';
+    return `${directory}concat_${Date.now()}.${outputFormat}`;
+  }
+
   // --- 拖拽排序 (鼠标事件模拟，兼容 WKWebView) ---
   // WKWebView (Tauri macOS) 对 HTML5 Drag & Drop API 支持不全，
   // dragenter/dragover/drop 事件不可靠，改用 mousedown/mousemove/mouseup 实现。
@@ -271,7 +280,7 @@
 
   // --- 拼接 ---
   async function startConcat() {
-    if (files.length < 2) return;
+    if (!canStart) return;
     result = null;
     running = true;
     progress = null;
@@ -283,7 +292,7 @@
     try {
       const res = await invoke('concat_videos', {
         inputs: files.map(f => f.path),
-        outputPath: outputPath || `concat_${Date.now()}.${outputFormat}`,
+        outputPath: outputPath || defaultOutputPath(),
         format: outputFormat,
       });
       result = res as any;
@@ -306,11 +315,16 @@
   }
 
   let canStart = $derived.by(() => {
-    return !running && ffmpegInfo?.installed && files.length >= 2;
+    return !running
+      && ffmpegInfo?.installed
+      && files.length >= 2
+      && files.every((file) => !file.loading && !file.error);
   });
 
   let validationMsg = $derived.by(() => {
     if (files.length < 2 && files.length > 0) return '至少选择 2 个视频文件';
+    if (files.some((file) => file.loading)) return '正在读取视频信息，请稍候';
+    if (files.some((file) => file.error)) return '请移除无法读取的视频文件后再开始';
     return '';
   });
 </script>

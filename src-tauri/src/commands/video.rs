@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -141,6 +141,31 @@ fn check_all_same_codec(inputs: &[String]) -> Result<bool, String> {
     Ok(true)
 }
 
+/// 检查输入文件是否包含音频流。
+fn has_audio_stream(input: &str) -> Result<bool, String> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            input,
+        ])
+        .output()
+        .map_err(|e| format!("无法执行 ffprobe: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe 分析文件失败 '{}': {}", input, stderr));
+    }
+
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
 /// 判断 ffmpeg 错误信息是否属于需要回退到 reencode 的格式错误
 fn is_format_error(stderr: &str) -> bool {
     let patterns = ["Non-monotonous DTS", "Invalid", "Packet mismatch"];
@@ -173,10 +198,14 @@ fn run_ffmpeg(
         .spawn()
         .map_err(|e| format!("无法启动 ffmpeg: {}", e))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("无法获取 ffmpeg stdout")?;
+    let stderr = child.stderr.take().ok_or("无法获取 ffmpeg stderr")?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut buf);
+        buf
+    });
+
+    let stdout = child.stdout.take().ok_or("无法获取 ffmpeg stdout")?;
     let reader = BufReader::new(stdout);
     let start_time = Instant::now();
 
@@ -191,6 +220,7 @@ fn run_ffmpeg(
         if cancel_flag.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stderr_reader.join();
             let _ = std::fs::remove_file(output_path);
             return Err("用户取消了拼接操作".to_string());
         }
@@ -212,11 +242,7 @@ fn run_ffmpeg(
                 let eta = if elapsed > 0.0 && percent > 0.0 {
                     let remaining_us = total_duration_us.saturating_sub(us) as f64;
                     let rate = us as f64 / elapsed; // 微秒/秒
-                    let remaining_secs = if rate > 0.0 {
-                        remaining_us / rate
-                    } else {
-                        0.0
-                    };
+                    let remaining_secs = if rate > 0.0 { remaining_us / rate } else { 0.0 };
                     format!("{:.0}s", remaining_secs)
                 } else {
                     "N/A".to_string()
@@ -240,17 +266,12 @@ fn run_ffmpeg(
     }
 
     // 等待 ffmpeg 进程结束
-    let status = child.wait().map_err(|e| format!("等待 ffmpeg 完成失败: {}", e))?;
+    let status = child
+        .wait()
+        .map_err(|e| format!("等待 ffmpeg 完成失败: {}", e))?;
 
-    // 读取 stderr 中的日志/错误信息
-    let stderr_output = if let Some(stderr) = child.stderr.take() {
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stderr);
-        let _ = std::io::Read::read_to_string(&mut reader, &mut buf);
-        buf
-    } else {
-        String::new()
-    };
+    // stderr 在进程运行期间已并发读取，避免其管道缓冲区写满而阻塞 ffmpeg。
+    let stderr_output = stderr_reader.join().unwrap_or_default();
 
     Ok((status, stderr_output))
 }
@@ -263,9 +284,7 @@ fn run_concat_copy(
     cancel_flag: Arc<AtomicBool>,
     total_duration_us: u64,
 ) -> Result<(ExitStatus, String), String> {
-    let list_str = temp_list_path
-        .to_str()
-        .ok_or("临时文件路径无效")?;
+    let list_str = temp_list_path.to_str().ok_or("临时文件路径无效")?;
 
     let args = vec![
         "-f".to_string(),
@@ -280,7 +299,13 @@ fn run_concat_copy(
         output_path.to_string(),
     ];
 
-    run_ffmpeg(app_handle, &args, cancel_flag, total_duration_us, output_path)
+    run_ffmpeg(
+        app_handle,
+        &args,
+        cancel_flag,
+        total_duration_us,
+        output_path,
+    )
 }
 
 /// 使用 filter_complex concat 重新编码方式执行拼接
@@ -304,35 +329,57 @@ fn run_concat_reencode(
         args.push(input.clone());
     }
 
-    // 构建 filter_complex 字符串: "[0:v][0:a][1:v][1:a]...concat=n=N:v=1:a=1[outv][outa]"
+    let audio_streams = inputs
+        .iter()
+        .map(|input| has_audio_stream(input))
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_audio = audio_streams[0];
+    if audio_streams.iter().any(|&present| present != has_audio) {
+        return Err("输入视频的音频轨道不一致；请使用全部带音频或全部无音频的视频".to_string());
+    }
+
+    // 无音轨视频使用 a=0，避免在 filter 中引用不存在的 [i:a] 流。
     let mut filter_parts = Vec::new();
     for i in 0..n {
-        filter_parts.push(format!("[{}:v][{}:a]", i, i));
+        filter_parts.push(if has_audio {
+            format!("[{}:v][{}:a]", i, i)
+        } else {
+            format!("[{}:v]", i)
+        });
     }
-    let filter_complex = format!(
-        "{}concat=n={}:v=1:a=1[outv][outa]",
-        filter_parts.join(""),
-        n
-    );
+    let filter_complex = if has_audio {
+        format!(
+            "{}concat=n={}:v=1:a=1[outv][outa]",
+            filter_parts.join(""),
+            n
+        )
+    } else {
+        format!("{}concat=n={}:v=1:a=0[outv]", filter_parts.join(""), n)
+    };
 
     args.push("-filter_complex".to_string());
     args.push(filter_complex);
     args.push("-map".to_string());
     args.push("[outv]".to_string());
-    args.push("-map".to_string());
-    args.push("[outa]".to_string());
+    if has_audio {
+        args.push("-map".to_string());
+        args.push("[outa]".to_string());
+    }
     args.push("-y".to_string());
     args.push(output_path.to_string());
 
-    run_ffmpeg(app_handle, &args, cancel_flag, total_duration_us, output_path)
+    run_ffmpeg(
+        app_handle,
+        &args,
+        cancel_flag,
+        total_duration_us,
+        output_path,
+    )
 }
 
 // ============ 构建 ConcatResult 辅助 ============
 
-fn build_concat_result_success(
-    start: Instant,
-    output: &str,
-) -> ConcatResult {
+fn build_concat_result_success(start: Instant, output: &str) -> ConcatResult {
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let file_size = std::fs::metadata(output).ok().map(|m| m.len());
     ConcatResult {
@@ -344,10 +391,7 @@ fn build_concat_result_success(
     }
 }
 
-fn build_concat_result_failure(
-    error: Option<String>,
-    start: Instant,
-) -> ConcatResult {
+fn build_concat_result_failure(error: Option<String>, start: Instant) -> ConcatResult {
     let elapsed_ms = start.elapsed().as_millis() as u64;
     ConcatResult {
         success: false,
@@ -369,6 +413,10 @@ pub fn concat_videos(
 ) -> Result<ConcatResult, String> {
     let start = Instant::now();
 
+    if inputs.len() < 2 {
+        return Err("至少需要两个输入文件才能拼接".to_string());
+    }
+
     // 0. 检查输入文件是否存在
     for input in &inputs {
         if !std::path::Path::new(input).exists() {
@@ -377,7 +425,9 @@ pub fn concat_videos(
     }
 
     // 1. 重置取消标志
-    app.state::<AppState>().cancel_flag.store(false, Ordering::SeqCst);
+    app.state::<AppState>()
+        .cancel_flag
+        .store(false, Ordering::SeqCst);
     let cancel_flag = app.state::<AppState>().cancel_flag.clone();
 
     // 2. 获取总时长
@@ -453,13 +503,17 @@ pub fn concat_videos(
     }
 
     // 6. 使用 reencode 模式（编码不同或 copy 失败需要回退）
-    match run_concat_reencode(&app, &inputs, &output, cancel_flag.clone(), total_duration_us) {
+    match run_concat_reencode(
+        &app,
+        &inputs,
+        &output,
+        cancel_flag.clone(),
+        total_duration_us,
+    ) {
         Ok((status, _stderr)) if status.success() => {
             Ok(build_concat_result_success(start, &output))
         }
-        Ok((_, stderr)) => {
-            Ok(build_concat_result_failure(Some(stderr), start))
-        }
+        Ok((_, stderr)) => Ok(build_concat_result_failure(Some(stderr), start)),
         Err(e) => Err(e),
     }
 }
@@ -474,16 +528,18 @@ pub fn cancel_concat(state: tauri::State<'_, AppState>) {
 #[tauri::command]
 pub fn get_video_info(path: String) -> Result<VideoInfo, String> {
     // 获取文件大小
-    let metadata = std::fs::metadata(&path)
-        .map_err(|e| format!("无法读取文件信息: {}", e))?;
+    let metadata = std::fs::metadata(&path).map_err(|e| format!("无法读取文件信息: {}", e))?;
     let file_size = metadata.len();
 
     // 通过 ffprobe 获取时长
     let output = Command::new("ffprobe")
         .args(&[
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             &path,
         ])
         .output()
@@ -495,7 +551,9 @@ pub fn get_video_info(path: String) -> Result<VideoInfo, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let duration_secs: f64 = stdout.trim().parse()
+    let duration_secs: f64 = stdout
+        .trim()
+        .parse()
         .map_err(|_| format!("无法解析视频时长: {}", path))?;
     let duration_us = (duration_secs * 1_000_000.0) as u64;
 
@@ -514,9 +572,7 @@ pub fn check_ffmpeg() -> FfmpegInfo {
     let path = which_ffmpeg();
 
     if let Some(path_str) = &path {
-        let output = Command::new("ffmpeg")
-            .arg("-version")
-            .output();
+        let output = Command::new("ffmpeg").arg("-version").output();
 
         match output {
             Ok(out) if out.status.success() => {
@@ -546,14 +602,19 @@ pub fn check_ffmpeg() -> FfmpegInfo {
 }
 
 fn which_ffmpeg() -> Option<String> {
-    let which_cmd = if cfg!(target_os = "windows") { "where" } else { "which" };
+    let which_cmd = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
     Command::new(which_cmd)
         .arg("ffmpeg")
         .output()
         .ok()
         .and_then(|o| {
             if o.status.success() {
-                String::from_utf8(o.stdout).ok()
+                String::from_utf8(o.stdout)
+                    .ok()
                     .map(|s| s.trim().to_string())
             } else {
                 None
@@ -581,7 +642,8 @@ pub fn show_item_in_folder(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "linux")]
     {
-        let parent = std::path::Path::new(&path).parent()
+        let parent = std::path::Path::new(&path)
+            .parent()
             .and_then(|p| p.to_str())
             .unwrap_or(&path);
         std::process::Command::new("xdg-open")

@@ -33,7 +33,7 @@
     {#if route.page !== 'home'}
       <button class="nav-back" onclick={goHome}>← 返回</button>
     {/if}
-    <h1 class="nav-title" onclick={goHome} onkeydown={(e) => e.key === 'Enter' && goHome()} role="button" tabindex="0">Trove2</h1>
+    <button class="nav-title" onclick={goHome}>Trove2</button>
   </div>
   {#if showSearch}
     <div class="nav-search">
@@ -71,6 +71,8 @@
   }
 
   .nav-title {
+    padding: 0;
+    border: 0;
     font-size: 20px;
     font-weight: 700;
     background: linear-gradient(135deg, var(--accent), #f093fb);
